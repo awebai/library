@@ -285,6 +285,14 @@ async def delete_blueprint(
         )
         if not deleted:
             raise HTTPException(status_code=404, detail="Blueprint not found")
+        # Detach EVERY dependent shelf profile, across ALL teams - this UPDATE is
+        # intentionally NOT scoped by team_id. A public blueprint can be imported
+        # onto any team's shelf, so deleting it must NULL every adopter's source pin,
+        # not just the owner's, or other teams orphan. Do not add a team_id predicate.
+        # The match is by source_blueprint_ref alone (the shelf row records no source
+        # owner_team): if two teams ever owned the same blueprint_ref, this would
+        # detach all dependents of that ref. Safe today (refs are single-owner);
+        # tracked for a per-owner detach (record source_owner_team) if that changes.
         await tx.execute(
             "UPDATE {{tables.shelf_profiles}} SET"
             " source_blueprint_ref = NULL, source_blueprint_version = NULL, source_blueprint_digest = NULL,"
