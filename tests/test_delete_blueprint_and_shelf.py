@@ -175,10 +175,18 @@ async def test_delete_blueprint_detaches_other_adopting_teams_shelf(migrated_db)
     # the OWNER deletes the blueprint.
     await delete_blueprint(db, principal=owner, blueprint_ref="aweb.engineering")
 
-    # the OTHER team's shelf is also detached (not orphaned), and survives.
+    # the OTHER team's shelf is also detached (not orphaned), and survives - all six
+    # source pins NULL, like the owner's own detach.
     after = await get_shelf_profile(db, principal=other, profile_ref="coordinator")
-    assert after["source_blueprint_ref"] is None
-    assert after["source_profile_ref"] is None
+    for field in (
+        "source_blueprint_ref",
+        "source_blueprint_version",
+        "source_blueprint_digest",
+        "source_profile_ref",
+        "source_profile_version",
+        "source_profile_digest",
+    ):
+        assert after[field] is None, field
     assert after["digest"] == before["digest"]
 
 
