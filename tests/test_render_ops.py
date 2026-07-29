@@ -2702,9 +2702,10 @@ def test_creation_evidence_make_target_is_one_read_only_checked_in_command() -> 
         text=True,
         capture_output=True,
     )
-    assert completed.stdout.splitlines() == [
-        "uv run python scripts/render_ops.py creation-evidence"
+    recipe_lines = [
+        line for line in completed.stdout.splitlines() if not line.startswith("make[")
     ]
+    assert recipe_lines == ["uv run python scripts/render_ops.py creation-evidence"]
 
 
 def test_make_mutation_recipe_does_not_shell_interpolate_values() -> None:
