@@ -20,10 +20,11 @@ Four predicate cells are registered as `instrumented-capability`:
 - `health.public.http-200`;
 - `health.public.payload-contract`.
 
-Every other predicate cell remains `deferred`. The source-owned coverage registry and static
-manifest contain the exact 50 candidate postdeploy predicates plus the 22 current-incumbent
-predicates added by the AATD follow-on, with exact owners, mappings, and per-obligation states.
-A subset therefore cannot imply global enforcement.
+Every other predicate cell remains `deferred`. The source-owned coverage registry and static manifest contain the exact 50 candidate
+postdeploy predicates plus the 22 current-incumbent predicates added by the AATD follow-on,
+with exact owners, mappings, and per-obligation states. Increment 2B separately instruments
+exactly four current-incumbent HTTP cells; it does not enlarge this candidate slice. A subset
+therefore cannot imply global enforcement.
 
 The driver records entered components and terminal assertions inside checked-in code. Callers
 cannot supply an observed path or outcome. Public negatives first pass origin, then fail at the

@@ -309,6 +309,12 @@ for each runtime. The other 18 mappings remain deferred, including all legacy re
 checks. Target output is diagnostic class `current-incumbent-debug`, which lifecycle validation
 forbids as evidence alongside capability fixtures.
 
+The AATK 2B contract fixture calls `run_current_incumbent` directly and instruments only the
+four origin/public HTTP-200 assertions. It keeps the real tunnel and raw-materialize path while
+substituting leaf DNS, loopback upstream, and released-aw process boundaries. That fixture does
+not exercise this Make target, parser/main selection, or released-aw artifact verification, and
+its transcript is forbidden as lifecycle evidence.
+
 The target deliberately does **not** query Render to prove that the asserted deploy is currently
 live, enforce same-path receipt execution, publish an AATK receipt, authorize a plan, or grant
 live-execution authority. Those identity, receipt, orchestration, and authority controls belong

@@ -187,6 +187,10 @@ def test_canonical_partial_manifest_is_spec_valid_and_matches_executor_universe(
         "health.origin.payload-contract",
         "health.public.http-200",
         "health.public.payload-contract",
+        "materialize.origin.claude-code.http-200",
+        "materialize.origin.pi.http-200",
+        "materialize.public.claude-code.http-200",
+        "materialize.public.pi.http-200",
     }
     assert aatk.DEFERRED_ENFORCEMENT_IDS >= aatk.CAPABILITY_OBLIGATION_IDS
 
@@ -420,6 +424,53 @@ def test_semantic_descriptors_reject_inventory_mismatch(
     )
 
 
+def test_current_capability_is_exactly_four_rows_without_candidate_propagation() -> None:
+    value = manifest()
+    assert aatk.validate_manifest(value) is value
+    current = {
+        row["id"]
+        for row in value["capability_coverage"]
+        if row["domain"] == "current-incumbent"
+        and set(row["obligations"].values()) == {"instrumented-capability"}
+    }
+    assert current == set(aatk.library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER)
+    deferred_current = {
+        row["id"]
+        for row in value["capability_coverage"]
+        if row["domain"] == "current-incumbent"
+        and set(row["obligations"].values()) == {"deferred"}
+    }
+    assert len(deferred_current) == 18
+    assert deferred_current == (
+        set(aatk.library_prod_gate.current_incumbent_predicate_inventory()) - current
+    )
+    candidate = {
+        row["id"]: set(row["obligations"].values())
+        for row in value["capability_coverage"]
+        if row["domain"] == "candidate-postdeploy"
+    }
+    for predicate_id in current:
+        if predicate_id in candidate:
+            assert candidate[predicate_id] == {"deferred"}
+
+
+def test_current_emitter_registration_cannot_diverge_from_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = manifest()
+    monkeypatch.setattr(
+        aatk.library_prod_gate,
+        "CURRENT_INCUMBENT_CAPABILITY_PREDICATES",
+        frozenset({"materialize.origin.claude-code.http-200"}),
+    )
+    assert_error(
+        "capability-emitter-registration",
+        "source.capability_coverage",
+        aatk.validate_manifest,
+        value,
+    )
+
+
 def test_capability_coverage_rejects_manifest_only_status_edit() -> None:
     value = manifest()
     value["capability_coverage"][0]["obligations"][
@@ -523,7 +574,14 @@ def test_lifecycle_validation_machine_blocks_on_every_deferred_obligation(mode: 
         assert obligation_id in str(error)
 
 
-@pytest.mark.parametrize("proof_kind", ["capability-fixture", "current-incumbent-debug"])
+@pytest.mark.parametrize(
+    "proof_kind",
+    [
+        "capability-fixture",
+        "current-incumbent-capability-fixture",
+        "current-incumbent-debug",
+    ],
+)
 def test_debug_and_capability_output_are_forbidden_as_lifecycle_evidence(
     proof_kind: str,
 ) -> None:

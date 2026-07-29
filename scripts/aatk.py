@@ -134,11 +134,15 @@ def source_capability_coverage() -> list[dict[str, Any]]:
         if isinstance(row.get("obligations"), dict)
         and set(row["obligations"].values()) == {"instrumented-capability"}
     }
-    if instrumented != render_ops.CAPABILITY_FIXTURE_PREDICATES:
+    emitter_predicates = (
+        render_ops.CAPABILITY_FIXTURE_PREDICATES
+        | frozenset(library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER)
+    )
+    if instrumented != emitter_predicates:
         fail(
             "capability-emitter-registration",
             "source.capability_coverage",
-            f"coverage/emitter mismatch: coverage={sorted(instrumented)} emitter={sorted(render_ops.CAPABILITY_FIXTURE_PREDICATES)}",
+            f"coverage/emitter mismatch: coverage={sorted(instrumented)} emitter={sorted(emitter_predicates)}",
         )
     return sorted(
         rows,
@@ -853,6 +857,382 @@ def validate_capability_transcript(value: Any) -> dict[str, Any]:
     return transcript
 
 
+def validate_current_incumbent_capability_transcript(value: Any) -> dict[str, Any]:
+    """Validate only the closed four-cell incumbent fixture variant."""
+    transcript = require_exact_keys(
+        value,
+        {
+            "schema",
+            "transcript_class",
+            "driver",
+            "domain",
+            "correlation_id",
+            "mutation_id",
+            "source",
+            "normalized_arguments",
+            "substitutions",
+            "observed_components",
+            "children",
+            "terminal",
+        },
+        location="current_capability",
+        code="current-capability-transcript",
+    )
+    expected_header = {
+        "schema": "library.aatk-current-incumbent-capability-transcript.v1",
+        "transcript_class": "current-incumbent-capability-fixture",
+        "driver": "library_prod_gate.run_current_incumbent",
+        "domain": "current-incumbent",
+    }
+    for field, expected in expected_header.items():
+        if transcript[field] != expected:
+            fail(
+                "current-capability-transcript",
+                f"current_capability.{field}",
+                f"must equal {expected}",
+            )
+    require_stable_id(
+        transcript["correlation_id"],
+        location="current_capability.correlation_id",
+        code="current-capability-transcript",
+    )
+    mutation_id = transcript["mutation_id"]
+    allowed_mutations = {
+        "",
+        *(
+            f"{predicate}.dedicated-negative"
+            for predicate in library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER
+        ),
+    }
+    if mutation_id not in allowed_mutations:
+        fail(
+            "current-capability-mutation",
+            "current_capability.mutation_id",
+            "must select one exact four-cell recipe",
+        )
+    source = require_exact_keys(
+        transcript["source"],
+        {"verifier_source_sha", "verifier_script_sha256", "verifier_script_path"},
+        location="current_capability.source",
+        code="current-capability-source",
+    )
+    if not isinstance(source["verifier_source_sha"], str) or not COMMIT_RE.fullmatch(
+        source["verifier_source_sha"]
+    ):
+        fail(
+            "current-capability-source",
+            "current_capability.source.verifier_source_sha",
+            "must be a commit",
+        )
+    if not isinstance(source["verifier_script_sha256"], str) or not SHA_RE.fullmatch(
+        source["verifier_script_sha256"]
+    ):
+        fail(
+            "current-capability-source",
+            "current_capability.source.verifier_script_sha256",
+            "must be sha256",
+        )
+    if source["verifier_script_path"] != "scripts/library_prod_gate.py":
+        fail(
+            "current-capability-source",
+            "current_capability.source.verifier_script_path",
+            "unexpected script",
+        )
+    arguments = require_exact_keys(
+        transcript["normalized_arguments"],
+        {
+            "service_id",
+            "deploy_id",
+            "commit",
+            "shape",
+            "public_url",
+            "origin_url",
+            "expected_profile_version",
+            "expected_profile_digest",
+        },
+        location="current_capability.normalized_arguments",
+        code="current-capability-arguments",
+    )
+    exact_arguments = {
+        "service_id": library_prod_gate.REQUIRED_INCUMBENT_SERVICE_ID,
+        "deploy_id": library_prod_gate.REQUIRED_INCUMBENT_DEPLOY_ID,
+        "commit": library_prod_gate.REQUIRED_INCUMBENT_COMMIT,
+        "shape": library_prod_gate.REQUIRED_INCUMBENT_SHAPE,
+    }
+    for field, expected in exact_arguments.items():
+        if arguments[field] != expected:
+            fail(
+                "current-capability-arguments",
+                f"current_capability.normalized_arguments.{field}",
+                f"must equal {expected}",
+            )
+    for field in ("public_url", "origin_url"):
+        if not isinstance(arguments[field], str):
+            fail(
+                "current-capability-arguments",
+                f"current_capability.normalized_arguments.{field}",
+                "must be a string",
+            )
+        try:
+            library_prod_gate._https_authority(
+                arguments[field], label=f"current capability {field}"
+            )
+        except library_prod_gate.GateError as exc:
+            fail(
+                "current-capability-arguments",
+                f"current_capability.normalized_arguments.{field}",
+                str(exc),
+            )
+    if not isinstance(arguments["expected_profile_version"], str) or not re.fullmatch(
+        r"[0-9A-Za-z]+(?:[._-][0-9A-Za-z]+)*",
+        arguments["expected_profile_version"],
+    ):
+        fail(
+            "current-capability-arguments",
+            "current_capability.normalized_arguments.expected_profile_version",
+            "must be a stable version",
+        )
+    if not isinstance(arguments["expected_profile_digest"], str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", arguments["expected_profile_digest"]
+    ):
+        fail(
+            "current-capability-arguments",
+            "current_capability.normalized_arguments.expected_profile_digest",
+            "must be a sha256 profile digest",
+        )
+    expected_substitutions = [
+        {
+            "boundary_id": "dns.leaf-fixture",
+            "position": "library-prod-gate.origin-connect-tunnel.startup-dns",
+        },
+        {
+            "boundary_id": "origin-upstream.loopback-fixture",
+            "position": "library-prod-gate.origin-connect-tunnel.upstream-socket",
+        },
+        {
+            "boundary_id": "released-aw.process-fixture",
+            "position": "library-prod-gate.run-checked.subprocess",
+        },
+    ]
+    if transcript["substitutions"] != expected_substitutions:
+        fail(
+            "current-capability-substitutions",
+            "current_capability.substitutions",
+            "must equal the leaf-boundary allowlist",
+        )
+    base_components = [
+        library_prod_gate.CURRENT_CAPABILITY_COMPONENT_DRIVER,
+        library_prod_gate.CURRENT_CAPABILITY_COMPONENT_IDENTITY,
+    ]
+    call_components = [
+        library_prod_gate.CurrentIncumbentCapabilityRecorder.component_id(
+            predicate.rsplit(".", 2)[1], predicate.split(".", 2)[1]
+        )
+        for predicate in library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER
+    ]
+    allowed_component_paths = [
+        [library_prod_gate.CURRENT_CAPABILITY_COMPONENT_DRIVER],
+        *[base_components + call_components[:count] for count in range(0, 5)],
+    ]
+    components = transcript["observed_components"]
+    if (
+        not isinstance(components, list)
+        or not components
+        or not all(isinstance(item, str) and ID_RE.fullmatch(item) for item in components)
+        or len(components) != len(set(components))
+    ):
+        fail(
+            "current-capability-components",
+            "current_capability.observed_components",
+            "must be unique stable entered components",
+        )
+    children = transcript["children"]
+    if not isinstance(children, list) or len(children) > 4:
+        fail("current-capability-children", "current_capability.children", "must be bounded")
+    recipes: list[tuple[str, str]] = []
+    for index, raw_child in enumerate(children):
+        location = f"current_capability.children[{index}]"
+        child = require_exact_keys(
+            raw_child,
+            {
+                "predicate_id",
+                "observed_subject_path",
+                "terminal",
+                "status_subject_name",
+                "status_subject_sha256",
+                "status_subject_size",
+            },
+            location=location,
+            code="current-capability-child",
+        )
+        expected_predicate = library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER[index]
+        if child["predicate_id"] != expected_predicate:
+            fail(
+                "current-capability-child-order",
+                f"{location}.predicate_id",
+                f"must equal {expected_predicate}",
+            )
+        expected_path = base_components + call_components[: index + 1]
+        if child["observed_subject_path"] != expected_path:
+            fail(
+                "current-capability-path",
+                f"{location}.observed_subject_path",
+                "must equal the exact entered prefix",
+            )
+        if expected_path != components[: len(expected_path)]:
+            fail(
+                "current-capability-path",
+                f"{location}.observed_subject_path",
+                "must be a prefix of the entered driver path",
+            )
+        terminal_child = require_exact_keys(
+            child["terminal"],
+            {"outcome", "assertion_code", "count"},
+            location=f"{location}.terminal",
+            code="current-capability-child",
+        )
+        outcome = terminal_child["outcome"]
+        if outcome not in {"passed", "expected-failure", "subject-failure"}:
+            fail("current-capability-child", f"{location}.terminal.outcome", "invalid outcome")
+        expected_assertion = (
+            f"{expected_predicate}.incumbent-capability-pass"
+            if outcome == "passed"
+            else f"{expected_predicate}.incumbent-capability-rejected"
+        )
+        if terminal_child["assertion_code"] != expected_assertion:
+            fail(
+                "current-capability-assertion",
+                f"{location}.terminal.assertion_code",
+                f"must equal {expected_assertion}",
+            )
+        if terminal_child["count"] != 1 or isinstance(terminal_child["count"], bool):
+            fail("current-capability-child", f"{location}.terminal.count", "must equal one")
+        expected_subject_name = (
+            "raw-current-capability-"
+            f"{expected_predicate.split('.', 2)[1]}-"
+            f"{expected_predicate.rsplit('.', 2)[1]}.stderr"
+        )
+        if child["status_subject_name"] != expected_subject_name:
+            fail(
+                "current-capability-child",
+                f"{location}.status_subject_name",
+                f"must equal {expected_subject_name}",
+            )
+        if not isinstance(child["status_subject_sha256"], str) or not SHA_RE.fullmatch(
+            child["status_subject_sha256"]
+        ):
+            fail(
+                "current-capability-child",
+                f"{location}.status_subject_sha256",
+                "must be sha256",
+            )
+        if (
+            not isinstance(child["status_subject_size"], int)
+            or isinstance(child["status_subject_size"], bool)
+            or not 0 <= child["status_subject_size"] <= 64
+        ):
+            fail(
+                "current-capability-child",
+                f"{location}.status_subject_size",
+                "must be an integer in [0,64]",
+            )
+        exact_status = (
+            b"HTTP 200\n"
+            if outcome == "passed"
+            else b"HTTP 403\n" if outcome == "expected-failure" else None
+        )
+        if exact_status is not None and (
+            child["status_subject_sha256"] != hashlib.sha256(exact_status).hexdigest()
+            or child["status_subject_size"] != len(exact_status)
+        ):
+            fail(
+                "current-capability-status-subject",
+                location,
+                "pass and dedicated-negative outcomes require their exact asserted status bytes",
+            )
+        recipes.append((expected_predicate, outcome))
+    terminal = require_exact_keys(
+        transcript["terminal"],
+        {"outcome", "error_code", "count"},
+        location="current_capability.terminal",
+        code="current-capability-terminal",
+    )
+    if terminal["outcome"] not in {"passed", "failed"}:
+        fail("current-capability-terminal", "current_capability.terminal.outcome", "invalid")
+    if not isinstance(terminal["error_code"], str):
+        fail("current-capability-terminal", "current_capability.terminal.error_code", "must be string")
+    if terminal["count"] != 1 or isinstance(terminal["count"], bool):
+        fail("current-capability-terminal", "current_capability.terminal.count", "must equal one")
+    positive = [(predicate, "passed") for predicate in library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER]
+    if terminal["outcome"] == "passed":
+        if mutation_id or components != allowed_component_paths[-1] or recipes != positive:
+            fail(
+                "current-capability-positive-recipe",
+                "current_capability",
+                "passing transcript must equal the exact four-cell recipe",
+            )
+        if terminal["error_code"]:
+            fail("current-capability-terminal", "current_capability.terminal.error_code", "must be empty")
+    elif terminal["error_code"] == "current-capability-subject-failure":
+        if recipes and recipes[-1][1] == "subject-failure":
+            valid_subject = (
+                recipes[:-1] == positive[: len(recipes) - 1]
+                and components == base_components + call_components[: len(recipes)]
+            )
+        else:
+            valid_subject = (
+                recipes == positive[: len(recipes)]
+                and components == base_components + call_components[: len(recipes)]
+            )
+        if not valid_subject:
+            fail(
+                "current-capability-subject-recipe",
+                "current_capability",
+                "subject failure must stop after exact pass prerequisites",
+            )
+    elif terminal["error_code"] in {
+        "current-capability-incomplete",
+        "current-capability-path-mismatch",
+    }:
+        if recipes != positive[: len(recipes)]:
+            fail(
+                "current-capability-structural-recipe",
+                "current_capability.children",
+                "structural failure may contain only a passing prefix",
+            )
+        if (
+            terminal["error_code"] != "current-capability-path-mismatch"
+            and components not in allowed_component_paths
+        ):
+            fail(
+                "current-capability-structural-recipe",
+                "current_capability.observed_components",
+                "non-path failure requires a canonical component prefix",
+            )
+    elif mutation_id:
+        target = mutation_id.removesuffix(".dedicated-negative")
+        target_index = library_prod_gate.CURRENT_INCUMBENT_CAPABILITY_ORDER.index(target)
+        expected_recipe = [*positive[:target_index], (target, "expected-failure")]
+        expected_error = f"{target}.dedicated-negative-observed"
+        if (
+            recipes != expected_recipe
+            or components != base_components + call_components[: target_index + 1]
+            or terminal["error_code"] != expected_error
+        ):
+            fail(
+                "current-capability-negative-recipe",
+                "current_capability",
+                "dedicated negative must have exact prerequisites and one terminal sibling",
+            )
+    else:
+        fail(
+            "current-capability-failure-variant",
+            "current_capability.terminal.error_code",
+            "unrecognized closed failure variant",
+        )
+    return transcript
+
+
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         fail("manifest-contract", "manifest", "must be an object")
@@ -1231,6 +1611,7 @@ def validate_receipt(
     proof_kind = receipt["proof_kind"]
     if isinstance(proof_kind, str) and proof_kind in {
         "capability-fixture",
+        "current-incumbent-capability-fixture",
         "current-incumbent-debug",
     }:
         fail(

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import shutil
 import socket
 import socketserver
+import stat
 import subprocess
+import tempfile
 import threading
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
+from scripts import aatk
 from scripts import library_prod_gate as gate
 
 EXPECTED_VERSION = "0.1.8"
@@ -806,6 +810,421 @@ def test_current_incumbent_identity_mismatch_fails_before_functional_calls(
     with pytest.raises(gate.GateError, match=field.replace("_", "-")):
         gate.run_current_incumbent(args, tmp_path)
     assert calls == []
+
+
+def _current_capability_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mutation_predicate: str = "",
+    process_failure_index: int = -1,
+) -> tuple[dict, list[tuple[str, str]], int]:
+    source = {
+        "verifier_source_sha": "a" * 40,
+        "verifier_script_sha256": "b" * 64,
+        "verifier_script_path": "scripts/library_prod_gate.py",
+    }
+    monkeypatch.setattr(gate, "_current_capability_source_identity", lambda: source)
+
+    class Upstream(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.recv(1024)
+
+    class FixtureServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    upstream = FixtureServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    original_getaddrinfo = socket.getaddrinfo
+
+    def fixture_dns(host, port, family=0, type=0, proto=0, flags=0):
+        targets = {"public.invalid": "127.0.0.2", "origin.invalid": "127.0.0.1"}
+        target = targets.get(host, host)
+        return original_getaddrinfo(target, port, family, type, proto, flags)
+
+    monkeypatch.setattr(gate.socket, "getaddrinfo", fixture_dns)
+    calls: list[tuple[str, str]] = []
+    traversals = 0
+    capability_root = Path(
+        tempfile.mkdtemp(prefix="library-current-capability-tests-")
+    ).resolve(strict=True)
+    capability_root.chmod(0o700)
+    capability_path = capability_root / "current-capability"
+    subject_root = capability_root / "subjects"
+    subject_root.mkdir(mode=0o700)
+    args = current_incumbent_args(
+        tmp_path,
+        public_url="https://public.invalid",
+        origin_url=f"https://origin.invalid:{upstream.server_address[1]}",
+        current_capability_dir=str(capability_path),
+        current_capability_correlation_id="current.slice.fixture",
+        current_capability_mutation_id=(
+            f"{mutation_predicate}.dedicated-negative" if mutation_predicate else ""
+        ),
+    )
+
+    def fixture_process(command, *, cwd, stdout, stderr, check, env=None, **kwargs):
+        nonlocal traversals
+        request_path = Path(command[command.index("--body-file") + 1])
+        runtime = json.loads(request_path.read_text())["runtime_kind"]
+        surface = "origin" if env is not None and "HTTPS_PROXY" in env else "public"
+        call_index = len(calls)
+        calls.append((surface, runtime))
+        if call_index == process_failure_index:
+            stderr.write(b"fixture process failed")
+            return subprocess.CompletedProcess(command, 9)
+        if surface == "origin":
+            proxy = gate.urlsplit(env["HTTPS_PROXY"])
+            with socket.create_connection((proxy.hostname, proxy.port), timeout=2) as client:
+                client.sendall(
+                    b"CONNECT public.invalid:443 HTTP/1.1\r\n"
+                    b"Host: public.invalid:443\r\n\r\n"
+                )
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    response += client.recv(4096)
+                assert response.startswith(b"HTTP/1.1 200 Connection Established\r\n")
+                client.sendall(b"fixture traversal")
+            traversals += 1
+        predicate = f"materialize.{surface}.{runtime}.http-200"
+        stdout.write(json.dumps(legacy_payload(runtime)).encode())
+        stderr.write(b"HTTP 403\n" if predicate == mutation_predicate else b"HTTP 200\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", fixture_process)
+    try:
+        if mutation_predicate or process_failure_index >= 0:
+            with pytest.raises(gate.GateError):
+                gate.run_current_incumbent(args, subject_root)
+        else:
+            gate.run_current_incumbent(args, subject_root)
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)
+    artifact_paths = sorted(capability_path.glob("*.json"))
+    assert stat.S_IMODE(capability_path.stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(item.stat().st_mode) == 0o600 for item in artifact_paths)
+    artifacts = [json.loads(item.read_text()) for item in artifact_paths]
+    events = [
+        item
+        for item in artifacts
+        if item.get("probe_kind") == "aatk-current-incumbent-capability-transcript"
+    ]
+    assert len(events) == 1
+    transcript = events[0]["transcript"]
+    assert aatk.validate_current_incumbent_capability_transcript(transcript) is transcript
+    for child in transcript["children"]:
+        captured = (subject_root / child["status_subject_name"]).read_bytes()
+        assert len(captured) == child["status_subject_size"]
+        assert hashlib.sha256(captured).hexdigest() == child["status_subject_sha256"]
+    shutil.rmtree(capability_root)
+    return transcript, calls, traversals
+
+
+def test_current_capability_source_identity_rejects_dirty_script(tmp_path: Path) -> None:
+    repo = tmp_path / "source-identity"
+    script = repo / "scripts" / "library_prod_gate.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("print('clean')\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    identity = gate._current_capability_source_identity(repo_root=repo, script_path=script)
+    assert identity["verifier_script_path"] == "scripts/library_prod_gate.py"
+    assert identity["verifier_script_sha256"] == hashlib.sha256(script.read_bytes()).hexdigest()
+    script.write_text("print('dirty')\n")
+    with pytest.raises(gate.GateError, match="tracked changes"):
+        gate._current_capability_source_identity(repo_root=repo, script_path=script)
+
+
+def test_current_capability_invalid_metadata_emits_one_setup_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        gate,
+        "_current_capability_source_identity",
+        lambda: {
+            "verifier_source_sha": "a" * 40,
+            "verifier_script_sha256": "b" * 64,
+            "verifier_script_path": "scripts/library_prod_gate.py",
+        },
+    )
+    root = Path(tempfile.mkdtemp(prefix="library-current-setup-tests-")).resolve(strict=True)
+    root.chmod(0o700)
+    output = root / "invalid"
+    args = current_incumbent_args(
+        tmp_path,
+        current_capability_dir=str(output),
+        current_capability_correlation_id="invalid correlation",
+        current_capability_mutation_id="",
+    )
+    with pytest.raises(gate.GateError, match="correlation ID"):
+        gate.run_current_incumbent(args, tmp_path)
+    artifacts = [json.loads(item.read_text()) for item in sorted(output.glob("*.json"))]
+    terminals = [
+        item
+        for item in artifacts
+        if item.get("probe_kind") == "aatk-current-incumbent-capability-setup-outcome"
+    ]
+    assert len(terminals) == 1
+    assert terminals[0] is artifacts[-1]
+    assert terminals[0]["outcome"] == "failed"
+    shutil.rmtree(root)
+
+
+def test_current_capability_rejects_secret_bearing_url_without_recording_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        gate,
+        "_current_capability_source_identity",
+        lambda: {
+            "verifier_source_sha": "a" * 40,
+            "verifier_script_sha256": "b" * 64,
+            "verifier_script_path": "scripts/library_prod_gate.py",
+        },
+    )
+    root = Path(tempfile.mkdtemp(prefix="library-current-secret-tests-")).resolve(strict=True)
+    root.chmod(0o700)
+    output = root / "invalid"
+    args = current_incumbent_args(
+        tmp_path,
+        public_url="https://operator:secret@public.invalid",
+        current_capability_dir=str(output),
+        current_capability_correlation_id="current.slice.fixture",
+        current_capability_mutation_id="",
+    )
+    with pytest.raises(gate.GateError, match="without path, query, or credentials"):
+        gate.run_current_incumbent(args, tmp_path)
+    encoded = b"".join(item.read_bytes() for item in sorted(output.glob("*.json")))
+    assert b"operator" not in encoded
+    assert b"secret" not in encoded
+    shutil.rmtree(root)
+
+
+def test_current_capability_secondary_finish_failure_preserves_subject_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        gate,
+        "_current_capability_source_identity",
+        lambda: {
+            "verifier_source_sha": "a" * 40,
+            "verifier_script_sha256": "b" * 64,
+            "verifier_script_path": "scripts/library_prod_gate.py",
+        },
+    )
+    root = Path(tempfile.mkdtemp(prefix="library-current-finish-tests-")).resolve(strict=True)
+    root.chmod(0o700)
+    calls = 0
+
+    def fail_finish(self, *, outcome: str, error_code: str = "") -> None:
+        nonlocal calls
+        calls += 1
+        raise gate.GateError("forced secondary finish failure")
+
+    monkeypatch.setattr(gate.CurrentIncumbentCapabilityRecorder, "finish", fail_finish)
+    args = current_incumbent_args(
+        tmp_path,
+        incumbent_commit="0" * 40,
+        current_capability_dir=str(root / "finish"),
+        current_capability_correlation_id="current.slice.fixture",
+        current_capability_mutation_id="",
+    )
+    with pytest.raises(gate.GateError, match="incumbent-commit must be exactly") as caught:
+        gate.run_current_incumbent(args, tmp_path)
+    assert calls == 1
+    assert caught.value.__notes__ == [
+        "current capability finalization failed: GateError"
+    ]
+    shutil.rmtree(root)
+
+
+def test_current_capability_preexisting_output_is_not_replaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        gate,
+        "_current_capability_source_identity",
+        lambda: {
+            "verifier_source_sha": "a" * 40,
+            "verifier_script_sha256": "b" * 64,
+            "verifier_script_path": "scripts/library_prod_gate.py",
+        },
+    )
+    root = Path(tempfile.mkdtemp(prefix="library-current-noreplace-tests-")).resolve(strict=True)
+    root.chmod(0o700)
+    output = root / "existing"
+    output.mkdir(mode=0o700)
+    marker = output / "retained"
+    marker.write_text("original")
+    marker.chmod(0o600)
+    args = current_incumbent_args(
+        tmp_path,
+        current_capability_dir=str(output),
+        current_capability_correlation_id="current.slice.fixture",
+        current_capability_mutation_id="",
+    )
+    with pytest.raises(RuntimeError, match="must not already exist"):
+        gate.run_current_incumbent(args, tmp_path)
+    assert marker.read_text() == "original"
+    assert list(output.iterdir()) == [marker]
+    shutil.rmtree(root)
+
+
+def test_current_capability_passes_four_http_cells_through_real_tunnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    transcript, calls, traversals = _current_capability_transcript(monkeypatch, tmp_path)
+    assert calls == [
+        ("origin", "claude-code"),
+        ("origin", "pi"),
+        ("public", "claude-code"),
+        ("public", "pi"),
+    ]
+    assert traversals == 2
+    assert [child["predicate_id"] for child in transcript["children"]] == list(
+        gate.CURRENT_INCUMBENT_CAPABILITY_ORDER
+    )
+    assert {child["terminal"]["outcome"] for child in transcript["children"]} == {
+        "passed"
+    }
+    assert transcript["terminal"] == {"outcome": "passed", "error_code": "", "count": 1}
+
+
+@pytest.mark.parametrize(
+    "predicate_id", gate.CURRENT_INCUMBENT_CAPABILITY_ORDER
+)
+def test_current_capability_http_negatives_have_exact_terminal_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, predicate_id: str
+) -> None:
+    transcript, calls, traversals = _current_capability_transcript(
+        monkeypatch, tmp_path, mutation_predicate=predicate_id
+    )
+    target_index = gate.CURRENT_INCUMBENT_CAPABILITY_ORDER.index(predicate_id)
+    assert len(calls) == target_index + 1
+    assert [child["terminal"]["outcome"] for child in transcript["children"]] == [
+        *(["passed"] * target_index),
+        "expected-failure",
+    ]
+    assert transcript["children"][-1]["status_subject_sha256"] == hashlib.sha256(
+        b"HTTP 403\n"
+    ).hexdigest()
+    assert transcript["terminal"]["error_code"] == (
+        f"{predicate_id}.dedicated-negative-observed"
+    )
+    assert traversals == min(target_index + 1, 2)
+
+
+def test_current_capability_transcript_schema_is_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    transcript, _, _ = _current_capability_transcript(monkeypatch, tmp_path)
+    incomplete = copy.deepcopy(transcript)
+    incomplete["mutation_id"] = "materialize.public.pi.http-200.dedicated-negative"
+    incomplete["terminal"] = {
+        "outcome": "failed",
+        "error_code": "current-capability-incomplete",
+        "count": 1,
+    }
+    assert (
+        aatk.validate_current_incumbent_capability_transcript(incomplete) is incomplete
+    )
+
+    mutations: list[tuple[dict, str]] = []
+
+    changed = copy.deepcopy(transcript)
+    changed["driver"] = "library_prod_gate.main"
+    mutations.append((changed, "current-capability-transcript"))
+
+    changed = copy.deepcopy(transcript)
+    changed["domain"] = "candidate-postdeploy"
+    mutations.append((changed, "current-capability-transcript"))
+
+    changed = copy.deepcopy(transcript)
+    changed["substitutions"][0]["boundary_id"] = "raw-materialize.mock"
+    mutations.append((changed, "current-capability-substitutions"))
+
+    changed = copy.deepcopy(transcript)
+    changed["children"].pop()
+    mutations.append((changed, "current-capability-positive-recipe"))
+
+    changed = copy.deepcopy(transcript)
+    changed["children"][0], changed["children"][1] = (
+        changed["children"][1],
+        changed["children"][0],
+    )
+    mutations.append((changed, "current-capability-child-order"))
+
+    changed = copy.deepcopy(transcript)
+    changed["children"][0]["status_subject_sha256"] = "not-a-digest"
+    mutations.append((changed, "current-capability-child"))
+
+    changed = copy.deepcopy(transcript)
+    changed["candidate_mapping"] = "identical"
+    mutations.append((changed, "current-capability-transcript"))
+
+    for changed, expected_code in mutations:
+        with pytest.raises(aatk.AATKError) as caught:
+            aatk.validate_current_incumbent_capability_transcript(changed)
+        assert caught.value.code == expected_code
+
+
+def test_current_capability_negative_rejects_later_child_and_unstable_top_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    passing, _, _ = _current_capability_transcript(monkeypatch, tmp_path)
+    negative, _, _ = _current_capability_transcript(
+        monkeypatch,
+        tmp_path,
+        mutation_predicate="materialize.origin.pi.http-200",
+    )
+    changed = copy.deepcopy(negative)
+    changed["children"].append(copy.deepcopy(passing["children"][2]))
+    with pytest.raises(aatk.AATKError) as caught:
+        aatk.validate_current_incumbent_capability_transcript(changed)
+    assert caught.value.code in {
+        "current-capability-path",
+        "current-capability-negative-recipe",
+    }
+
+    changed = copy.deepcopy(negative)
+    changed["children"][-1]["status_subject_sha256"] = hashlib.sha256(
+        b"HTTP 404\n"
+    ).hexdigest()
+    with pytest.raises(aatk.AATKError) as caught:
+        aatk.validate_current_incumbent_capability_transcript(changed)
+    assert caught.value.code == "current-capability-status-subject"
+
+    changed = copy.deepcopy(negative)
+    changed["terminal"]["error_code"] = "GateError"
+    with pytest.raises(aatk.AATKError) as caught:
+        aatk.validate_current_incumbent_capability_transcript(changed)
+    assert caught.value.code == "current-capability-negative-recipe"
+
+
+def test_current_capability_process_failure_is_not_an_http_negative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    transcript, calls, traversals = _current_capability_transcript(
+        monkeypatch,
+        tmp_path,
+        mutation_predicate="materialize.public.pi.http-200",
+        process_failure_index=3,
+    )
+    assert len(calls) == 4
+    assert [child["terminal"]["outcome"] for child in transcript["children"]] == [
+        "passed",
+        "passed",
+        "passed",
+    ]
+    assert transcript["terminal"]["error_code"] == "current-capability-subject-failure"
+    assert traversals == 2
 
 
 def test_current_incumbent_runs_pinned_origin_then_mandatory_public_for_both_runtimes(

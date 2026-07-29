@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import ipaddress
 import json
 import os
@@ -25,6 +26,10 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+HealthEvidenceRun = importlib.import_module(
+    "scripts.render_ops" if __package__ else "render_ops"
+).HealthEvidenceRun
 
 RUNTIMES = ("claude-code", "pi")
 REQUIRED_PUBLIC_URL = "https://library.aweb.ai"
@@ -217,6 +222,22 @@ CURRENT_INCUMBENT_RESPONSE_CONTRACT_PREDICATES = frozenset(
     {f"materialize.origin.response-contract.{runtime}" for runtime in RUNTIMES}
     | {f"materialize.response-contract.{runtime}" for runtime in RUNTIMES}
 )
+CURRENT_INCUMBENT_CAPABILITY_PREDICATES = frozenset(
+    {
+        "materialize.origin.claude-code.http-200",
+        "materialize.origin.pi.http-200",
+        "materialize.public.claude-code.http-200",
+        "materialize.public.pi.http-200",
+    }
+)
+CURRENT_INCUMBENT_CAPABILITY_ORDER = (
+    "materialize.origin.claude-code.http-200",
+    "materialize.origin.pi.http-200",
+    "materialize.public.claude-code.http-200",
+    "materialize.public.pi.http-200",
+)
+CURRENT_CAPABILITY_COMPONENT_DRIVER = "library-prod-gate.run-current-incumbent"
+CURRENT_CAPABILITY_COMPONENT_IDENTITY = "library-prod-gate.current-incumbent-identity"
 CURRENT_INCUMBENT_BASE_BLOCKERS = (
     "controls.executed-same-path",
     "execution.capability-obligation",
@@ -373,7 +394,12 @@ def aatk_predicate_coverage() -> list[dict[str, Any]]:
             "owner": _current_incumbent_owner(predicate_id),
             "candidate_mapping": _current_incumbent_mapping(predicate_id),
             "obligations": {
-                obligation: "deferred" for obligation in AATK_CAPABILITY_OBLIGATIONS
+                obligation: (
+                    "instrumented-capability"
+                    if predicate_id in CURRENT_INCUMBENT_CAPABILITY_PREDICATES
+                    else "deferred"
+                )
+                for obligation in AATK_CAPABILITY_OBLIGATIONS
             },
         }
         for predicate_id in current_incumbent_predicate_inventory()
@@ -383,6 +409,293 @@ def aatk_predicate_coverage() -> list[dict[str, Any]]:
 
 class GateError(RuntimeError):
     pass
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPT_PATH = Path(__file__).resolve()
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _current_capability_source_identity(
+    *, repo_root: Path = _REPOSITORY_ROOT, script_path: Path = _SCRIPT_PATH
+) -> dict[str, str]:
+    try:
+        root = repo_root.resolve(strict=True)
+        script = script_path.resolve(strict=True)
+        relative_script = script.relative_to(root)
+        top_level = Path(
+            subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+        ).resolve(strict=True)
+        if top_level != root:
+            raise GateError("current capability repository root does not match the script")
+        source_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        if not _COMMIT_RE.fullmatch(source_sha):
+            raise GateError("current capability source commit is invalid")
+        if subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout:
+            raise GateError("current capability repository has tracked changes")
+        committed_script = subprocess.run(
+            ["git", "-C", str(root), "show", f"HEAD:{relative_script.as_posix()}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        script_bytes = script.read_bytes()
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        raise GateError("failed to establish current capability source identity") from exc
+    if script_bytes != committed_script:
+        raise GateError("current capability script does not match its source commit")
+    return {
+        "verifier_source_sha": source_sha,
+        "verifier_script_sha256": hashlib.sha256(script_bytes).hexdigest(),
+        "verifier_script_path": relative_script.as_posix(),
+    }
+
+
+class CurrentIncumbentCapabilityRecorder:
+    """Closed, unattested transcript for four incumbent HTTP assertions."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        args: argparse.Namespace,
+        correlation_id: str,
+        mutation_id: str,
+    ) -> None:
+        source_identity = _current_capability_source_identity()
+        self._evidence = HealthEvidenceRun(
+            path,
+            label="aatk-current-incumbent-capability-fixture",
+            metadata={
+                "transcript_class": "current-incumbent-capability-fixture",
+                "driver": "library_prod_gate.run_current_incumbent",
+                "domain": "current-incumbent",
+                "verifier_source_sha": source_identity["verifier_source_sha"],
+                "verifier_script_sha256": source_identity["verifier_script_sha256"],
+            },
+        )
+        try:
+            if not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", correlation_id):
+                raise GateError("current capability correlation ID must be stable")
+            allowed_mutations = {
+                "",
+                *(
+                    f"{predicate}.dedicated-negative"
+                    for predicate in CURRENT_INCUMBENT_CAPABILITY_ORDER
+                ),
+            }
+            if mutation_id not in allowed_mutations:
+                raise GateError("current capability mutation ID is not an exact recipe")
+            public_url = str(args.public_url)
+            origin_url = str(args.origin_url)
+            _https_authority(public_url, label="current capability public URL")
+            _https_authority(origin_url, label="current capability origin URL")
+            expected_profile_version = str(args.expected_profile_version)
+            expected_profile_digest = str(args.expected_profile_digest)
+            if not re.fullmatch(
+                r"[0-9A-Za-z]+(?:[._-][0-9A-Za-z]+)*", expected_profile_version
+            ):
+                raise GateError("current capability profile version must be stable")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_profile_digest):
+                raise GateError("current capability profile digest must be sha256-pinned")
+        except Exception as exc:
+            self._evidence.finish(
+                {
+                    "probe_kind": "aatk-current-incumbent-capability-setup-outcome",
+                    "outcome": "failed",
+                    "error_code": "current-capability-setup-invalid",
+                    "error_class": type(exc).__name__,
+                }
+            )
+            raise
+        self._metadata = {
+            "schema": "library.aatk-current-incumbent-capability-transcript.v1",
+            "transcript_class": "current-incumbent-capability-fixture",
+            "driver": "library_prod_gate.run_current_incumbent",
+            "domain": "current-incumbent",
+            "correlation_id": correlation_id,
+            "mutation_id": mutation_id,
+            "source": source_identity,
+            "normalized_arguments": {
+                "service_id": REQUIRED_INCUMBENT_SERVICE_ID,
+                "deploy_id": REQUIRED_INCUMBENT_DEPLOY_ID,
+                "commit": REQUIRED_INCUMBENT_COMMIT,
+                "shape": REQUIRED_INCUMBENT_SHAPE,
+                "public_url": public_url,
+                "origin_url": origin_url,
+                "expected_profile_version": expected_profile_version,
+                "expected_profile_digest": expected_profile_digest,
+            },
+            "substitutions": [
+                {
+                    "boundary_id": "dns.leaf-fixture",
+                    "position": "library-prod-gate.origin-connect-tunnel.startup-dns",
+                },
+                {
+                    "boundary_id": "origin-upstream.loopback-fixture",
+                    "position": "library-prod-gate.origin-connect-tunnel.upstream-socket",
+                },
+                {
+                    "boundary_id": "released-aw.process-fixture",
+                    "position": "library-prod-gate.run-checked.subprocess",
+                },
+            ],
+        }
+        self.components: list[str] = []
+        self.children: list[dict[str, Any]] = []
+        self._terminal = False
+
+    def enter(self, component_id: str) -> None:
+        if self._terminal:
+            raise GateError("current-capability-already-terminal")
+        if component_id in self.components:
+            raise GateError(f"current-capability-duplicate-component: {component_id}")
+        self.components.append(component_id)
+
+    @staticmethod
+    def component_id(runtime: str, surface: str) -> str:
+        return f"library-prod-gate.raw-materialize.{surface}.{runtime}"
+
+    def observe_http_status(self, runtime: str, surface: str, status_bytes: bytes) -> None:
+        predicate_id = f"materialize.{surface}.{runtime}.http-200"
+        index = len(self.children)
+        if index >= len(CURRENT_INCUMBENT_CAPABILITY_ORDER):
+            raise GateError(f"current-capability-unexpected-child: {predicate_id}")
+        expected_predicate = CURRENT_INCUMBENT_CAPABILITY_ORDER[index]
+        if predicate_id != expected_predicate:
+            raise GateError(
+                f"current-capability-path-mismatch: expected {expected_predicate}, got {predicate_id}"
+            )
+        component = self.component_id(runtime, surface)
+        self.enter(component)
+        expected_components = [
+            CURRENT_CAPABILITY_COMPONENT_DRIVER,
+            CURRENT_CAPABILITY_COMPONENT_IDENTITY,
+            *(
+                self.component_id(
+                    item.rsplit(".", 2)[1],
+                    item.split(".", 2)[1],
+                )
+                for item in CURRENT_INCUMBENT_CAPABILITY_ORDER[: index + 1]
+            ),
+        ]
+        if self.components != expected_components:
+            raise GateError(f"current-capability-path-mismatch: {predicate_id}")
+        if len(status_bytes) > 64:
+            raise GateError("current-capability-status-subject-too-large")
+        passed = status_bytes == b"HTTP 200\n"
+        dedicated_negative = self._metadata["mutation_id"] == (
+            f"{predicate_id}.dedicated-negative"
+        )
+        child_outcome = (
+            "passed"
+            if passed
+            else "expected-failure" if dedicated_negative else "subject-failure"
+        )
+        self.children.append(
+            {
+                "predicate_id": predicate_id,
+                "observed_subject_path": list(self.components),
+                "terminal": {
+                    "outcome": child_outcome,
+                    "assertion_code": (
+                        f"{predicate_id}.incumbent-capability-pass"
+                        if passed
+                        else f"{predicate_id}.incumbent-capability-rejected"
+                    ),
+                    "count": 1,
+                },
+                "status_subject_name": (
+                    f"raw-current-capability-{surface}-{runtime}.stderr"
+                ),
+                "status_subject_sha256": hashlib.sha256(status_bytes).hexdigest(),
+                "status_subject_size": len(status_bytes),
+            }
+        )
+
+    def failure_code(self, exc: Exception) -> str:
+        negatives = [
+            child
+            for child in self.children
+            if child["terminal"]["outcome"] == "expected-failure"
+        ]
+        if len(negatives) == 1 and self._metadata["mutation_id"] == (
+            f"{negatives[0]['predicate_id']}.dedicated-negative"
+        ):
+            return f"{negatives[0]['predicate_id']}.dedicated-negative-observed"
+        text = str(exc)
+        if text.startswith("current-capability-path-mismatch"):
+            return "current-capability-path-mismatch"
+        if text.startswith("current-capability-incomplete"):
+            return "current-capability-incomplete"
+        return "current-capability-subject-failure"
+
+    def finish(self, *, outcome: str, error_code: str = "") -> None:
+        if self._terminal:
+            return
+        incomplete = ""
+        if outcome == "passed":
+            observed = tuple(child["predicate_id"] for child in self.children)
+            nonpassing = [
+                child["predicate_id"]
+                for child in self.children
+                if child["terminal"]["outcome"] != "passed"
+            ]
+            if (
+                observed != CURRENT_INCUMBENT_CAPABILITY_ORDER
+                or nonpassing
+                or self._metadata["mutation_id"]
+            ):
+                incomplete = "current-capability-incomplete"
+                outcome = "failed"
+                error_code = incomplete
+        self._terminal = True
+        transcript = {
+            **self._metadata,
+            "observed_components": list(self.components),
+            "children": list(self.children),
+            "terminal": {"outcome": outcome, "error_code": error_code, "count": 1},
+        }
+        encoded = json.dumps(transcript, ensure_ascii=True, sort_keys=True).encode()
+        if len(encoded) > 65_536:
+            self._evidence.close()
+            raise GateError("current capability transcript exceeded evidence bound")
+        self._evidence.finish(
+            {"probe_kind": "aatk-current-incumbent-capability-transcript", "transcript": transcript}
+        )
+        if incomplete:
+            raise GateError(incomplete)
+
+
+def _current_capability_fixture(
+    args: argparse.Namespace,
+) -> CurrentIncumbentCapabilityRecorder | None:
+    value = str(getattr(args, "current_capability_dir", "") or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise GateError("current capability output path must be absolute")
+    return CurrentIncumbentCapabilityRecorder(
+        path,
+        args=args,
+        correlation_id=str(getattr(args, "current_capability_correlation_id", "") or ""),
+        mutation_id=str(getattr(args, "current_capability_mutation_id", "") or ""),
+    )
 
 
 def _https_authority(url: str, *, label: str) -> tuple[str, int, str]:
@@ -858,10 +1171,17 @@ def raw_materialize(
     root: Path,
     *,
     origin_tunnel: OriginConnectTunnel | None = None,
+    capability: CurrentIncumbentCapabilityRecorder | None = None,
+    capability_surface: str = "",
 ) -> dict[str, Any]:
-    request = root / f"raw-{runtime}.request.json"
-    response = root / f"raw-{runtime}.response.json"
-    stderr = root / f"raw-{runtime}.stderr"
+    artifact_stem = (
+        f"raw-current-capability-{capability_surface}-{runtime}"
+        if capability is not None
+        else f"raw-{runtime}"
+    )
+    request = root / f"{artifact_stem}.request.json"
+    response = root / f"{artifact_stem}.response.json"
+    stderr = root / f"{artifact_stem}.stderr"
     request.write_text(
         json.dumps({"profile_ref": "developer", "runtime_kind": runtime, "target": "local"}) + "\n",
         encoding="utf-8",
@@ -892,7 +1212,12 @@ def raw_materialize(
             else None
         ),
     )
-    if stderr.read_text(encoding="utf-8", errors="replace") != "HTTP 200\n":
+    status_bytes = stderr.read_bytes()
+    if capability is not None:
+        if capability_surface not in {"origin", "public"}:
+            raise GateError("current-capability-surface-invalid")
+        capability.observe_http_status(runtime, capability_surface, status_bytes)
+    if status_bytes != b"HTTP 200\n":
         raise GateError(f"raw materialize {runtime} did not return exact HTTP 200")
     if origin_tunnel is not None and (
         origin_tunnel.connection_attempts != 1
@@ -1175,18 +1500,57 @@ def _current_incumbent_public_predicates(runtime: str) -> list[str]:
 
 
 def run_current_incumbent(args: argparse.Namespace, root: Path) -> list[dict[str, Any]]:
-    summaries: list[dict[str, Any]] = [validate_current_incumbent_identity(args)]
-    for runtime in RUNTIMES:
-        with OriginConnectTunnel(
-            canonical_url=args.public_url, origin_url=args.origin_url
-        ) as origin_tunnel:
+    capability: CurrentIncumbentCapabilityRecorder | None = None
+    try:
+        capability = _current_capability_fixture(args)
+        if capability is not None:
+            capability.enter(CURRENT_CAPABILITY_COMPONENT_DRIVER)
+        summaries: list[dict[str, Any]] = [validate_current_incumbent_identity(args)]
+        if capability is not None:
+            capability.enter(CURRENT_CAPABILITY_COMPONENT_IDENTITY)
+        origin_capability_kwargs: dict[str, Any] = {}
+        public_capability_kwargs: dict[str, Any] = {}
+        if capability is not None:
+            origin_capability_kwargs = {
+                "capability": capability,
+                "capability_surface": "origin",
+            }
+            public_capability_kwargs = {
+                "capability": capability,
+                "capability_surface": "public",
+            }
+        for runtime in RUNTIMES:
+            with OriginConnectTunnel(
+                canonical_url=args.public_url, origin_url=args.origin_url
+            ) as origin_tunnel:
+                payload = raw_materialize(
+                    REQUIRED_AW_PATH,
+                    args.source_home,
+                    args.public_url,
+                    runtime,
+                    root,
+                    origin_tunnel=origin_tunnel,
+                    **origin_capability_kwargs,
+                )
+                summary = validate_recovery_payload(
+                    payload,
+                    runtime,
+                    expected_version=args.expected_profile_version,
+                    expected_digest=args.expected_profile_digest,
+                )
+                summary["gate"] = "raw-current-incumbent-origin"
+                summary["transport_route"] = "generated-origin-direct"
+                summary["transport_peer_ip"] = origin_tunnel.peer_ip
+                summary["predicate_ids"] = _current_incumbent_origin_predicates(runtime)
+                summaries.append(summary)
+        for runtime in RUNTIMES:
             payload = raw_materialize(
                 REQUIRED_AW_PATH,
                 args.source_home,
                 args.public_url,
                 runtime,
                 root,
-                origin_tunnel=origin_tunnel,
+                **public_capability_kwargs,
             )
             summary = validate_recovery_payload(
                 payload,
@@ -1194,33 +1558,31 @@ def run_current_incumbent(args: argparse.Namespace, root: Path) -> list[dict[str
                 expected_version=args.expected_profile_version,
                 expected_digest=args.expected_profile_digest,
             )
-            summary["gate"] = "raw-current-incumbent-origin"
-            summary["transport_route"] = "generated-origin-direct"
-            summary["transport_peer_ip"] = origin_tunnel.peer_ip
-            summary["predicate_ids"] = _current_incumbent_origin_predicates(runtime)
+            summary["gate"] = "raw-current-incumbent-public"
+            summary["predicate_ids"] = _current_incumbent_public_predicates(runtime)
             summaries.append(summary)
-    for runtime in RUNTIMES:
-        payload = raw_materialize(
-            REQUIRED_AW_PATH, args.source_home, args.public_url, runtime, root
+        summaries.append(
+            {
+                "gate": "current-incumbent-predicate-inventory",
+                "predicate_paths": current_incumbent_predicate_paths(),
+            }
         )
-        summary = validate_recovery_payload(
-            payload,
-            runtime,
-            expected_version=args.expected_profile_version,
-            expected_digest=args.expected_profile_digest,
-        )
-        summary["gate"] = "raw-current-incumbent-public"
-        summary["predicate_ids"] = _current_incumbent_public_predicates(runtime)
-        summaries.append(summary)
-    summaries.append(
-        {
-            "gate": "current-incumbent-predicate-inventory",
-            "predicate_paths": current_incumbent_predicate_paths(),
-        }
-    )
-    for summary in summaries:
-        summary["output_class"] = "current-incumbent-debug"
-    return summaries
+        for summary in summaries:
+            summary["output_class"] = "current-incumbent-debug"
+        if capability is not None:
+            capability.finish(outcome="passed")
+        return summaries
+    except Exception as exc:
+        if capability is not None:
+            try:
+                capability.finish(
+                    outcome="failed", error_code=capability.failure_code(exc)
+                )
+            except Exception as finish_exc:
+                exc.add_note(
+                    f"current capability finalization failed: {type(finish_exc).__name__}"
+                )
+        raise
 
 
 def run_recovery(args: argparse.Namespace, root: Path) -> list[dict[str, Any]]:
