@@ -1731,7 +1731,7 @@ def command_creation_evidence(args: argparse.Namespace) -> dict[str, Any]:
             for summary in blueprints:
                 blueprint_id = summary.get("id")
                 if not isinstance(blueprint_id, str) or not re.fullmatch(
-                    r"bpr-[a-z0-9]+", blueprint_id
+                    r"exs-[a-z0-9]+", blueprint_id
                 ):
                     blueprints_complete = False
                     continue

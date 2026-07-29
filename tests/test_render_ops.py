@@ -313,10 +313,10 @@ def test_render_client_cursor_pages_distinguish_complete_from_truncated(
     client = render_ops.RenderClient("secret")
     calls: list[str] = []
     first_page = [
-        {"blueprint": {"id": f"bpr-{index}"}, "cursor": f"cursor-{index}"}
+        {"blueprint": {"id": f"exs-cursor{index}"}, "cursor": f"cursor-{index}"}
         for index in range(100)
     ]
-    responses = [first_page, [{"blueprint": {"id": "bpr-last"}, "cursor": "last"}]]
+    responses = [first_page, [{"blueprint": {"id": "exs-last"}, "cursor": "last"}]]
 
     def request(method: str, path: str, payload=None):
         calls.append(path)
@@ -333,7 +333,7 @@ def test_render_client_cursor_pages_distinguish_complete_from_truncated(
 
     repeated = render_ops.RenderClient("secret")
     page = [
-        {"blueprint": {"id": f"bpr-{index}"}, "cursor": "same"}
+        {"blueprint": {"id": f"exs-repeat{index}"}, "cursor": "same"}
         for index in range(100)
     ]
     monkeypatch.setattr(repeated, "request", lambda *args, **kwargs: page)
@@ -1756,10 +1756,12 @@ def test_creation_evidence_reports_only_sanitized_linkage_and_rename_history(
 ) -> None:
     client = CreationEvidenceClient(
         config,
-        blueprints=[{"id": "bpr-library", "name": "Library production"}],
+        blueprints=[
+            {"id": "exs-cph1rs3idesc73a2b2mg", "name": "Library production"}
+        ],
         blueprint_details={
-            "bpr-library": {
-                "id": "bpr-library",
+            "exs-cph1rs3idesc73a2b2mg": {
+                "id": "exs-cph1rs3idesc73a2b2mg",
                 "name": "Library production",
                 "resources": [
                     {"id": config.service_id, "name": "library", "type": "web_service"},
@@ -1802,7 +1804,9 @@ def test_creation_evidence_reports_only_sanitized_linkage_and_rename_history(
         },
         "blueprint_linkage": {
             "state": "currently-linked",
-            "blueprints": [{"id": "bpr-library", "name": "Library production"}],
+            "blueprints": [
+                {"id": "exs-cph1rs3idesc73a2b2mg", "name": "Library production"}
+            ],
         },
         "rename_history": {
             "state": "observed",
