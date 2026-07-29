@@ -42,9 +42,17 @@ is `srv-d8qm4jvavr4c73dhrmgg`, named `library`, in `virginia`, with generated or
 Render before acting.
 
 Repository history does not establish whether the scaffold template was ever linked to
-the live Render service. Until that relationship is verified from sanitized live
-metadata, do not apply the template to production, delete it as presumed inert, or claim
-that changing it changes the existing service.
+the live Render service. `make prod-creation-evidence` answers what Render can establish
+without exposing unrelated production data. It reports the service `createdAt`, current
+Blueprint membership, and sanitized service rename audit events. It never prints actors,
+raw audit metadata, environment variables, credentials, or unrelated Blueprint resources.
+
+A complete Blueprint inventory with no matching resource means only
+`not-currently-linked`. An empty or retention-limited audit response means
+`none-observed` or `unknown`, not proof that no rename occurred. Render's published audit
+contract has no service-region history event, so region history reports `unknown` rather
+than inventing a conclusion. Creation mode is `blueprint` only when current resource
+linkage or a service-targeted Blueprint audit proves it; otherwise it remains `unknown`.
 
 ### Credential-less topology boundary
 
@@ -80,6 +88,7 @@ rollback artifact after starting the deploy.
 |---|---|
 | `make prod-ops-test` | Mocked operations and gate tests; no network mutation. |
 | `make prod-status` | Read-only topology and current-live-deploy preflight. |
+| `make prod-creation-evidence` | Read-only sanitized creation/linkage/history evidence; unknown stays unknown. |
 | `make prod-health-client-proof ...` | Makes exactly two bounded canonical health requests: the known-blocked baseline UA must return 403 and the honest gate UA must return the exact 200 payload; persists both artifacts. |
 | `make prod-gate-current-incumbent ...` | Read-only semantic probe of the exact pinned pre-aasb incumbent: authenticated generated-origin then mandatory public materialization for both runtimes, validating only the pinned legacy response shape. It does not prove the asserted deploy is live or emit AATK receipts. |
 | `make prod-deploy ... APPLY=1` | Validates topology and rollback pin, fetches and verifies exact `origin/main`, starts a clear-cache deploy, waits for `live`, then waits boundedly for exact origin and public health readiness. |

@@ -191,6 +191,41 @@ def test_load_api_key_requires_private_file(tmp_path: Path) -> None:
         render_ops.load_api_key(link)
 
 
+def test_render_client_cursor_pages_distinguish_complete_from_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = render_ops.RenderClient("secret")
+    calls: list[str] = []
+    first_page = [
+        {"blueprint": {"id": f"bpr-{index}"}, "cursor": f"cursor-{index}"}
+        for index in range(100)
+    ]
+    responses = [first_page, [{"blueprint": {"id": "bpr-last"}, "cursor": "last"}]]
+
+    def request(method: str, path: str, payload=None):
+        calls.append(path)
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, "request", request)
+    items, complete = client.blueprints("own-a/b")
+    assert complete is True
+    assert len(items) == 101
+    assert calls == [
+        "/blueprints?ownerId=own-a%2Fb&limit=100",
+        "/blueprints?ownerId=own-a%2Fb&limit=100&cursor=cursor-99",
+    ]
+
+    repeated = render_ops.RenderClient("secret")
+    page = [
+        {"blueprint": {"id": f"bpr-{index}"}, "cursor": "same"}
+        for index in range(100)
+    ]
+    monkeypatch.setattr(repeated, "request", lambda *args, **kwargs: page)
+    items, complete = repeated.blueprints("own")
+    assert len(items) == 100
+    assert complete is False
+
+
 def test_git_repo_canonicalization_accepts_https_and_ssh_forms() -> None:
     assert render_ops.canonical_git_repo("git@github.com:awebai/library.git") == (
         render_ops.canonical_git_repo("https://github.com/awebai/library")
@@ -1516,6 +1551,224 @@ class FakeClient:
         raise AssertionError(deploy_id)
 
 
+class CreationEvidenceClient:
+    def __init__(
+        self,
+        config: render_ops.ProductionConfig,
+        *,
+        blueprints: list[dict] | None = None,
+        blueprint_details: dict[str, dict] | None = None,
+        audits: list[dict] | None = None,
+        blueprints_complete: bool = True,
+        audits_complete: bool = True,
+        fail_optional: bool = False,
+    ) -> None:
+        self.config = config
+        self.blueprint_rows = blueprints or []
+        self.blueprint_details = blueprint_details or {}
+        self.audit_rows = audits or []
+        self.blueprints_complete = blueprints_complete
+        self.audits_complete = audits_complete
+        self.fail_optional = fail_optional
+
+    def service(self, service_id: str) -> dict:
+        value = service(self.config)
+        value.update({"ownerId": "own-secret", "createdAt": "2026-01-02T03:04:05Z"})
+        return value
+
+    def blueprints(self, owner_id: str) -> tuple[list[dict], bool]:
+        assert owner_id == "own-secret"
+        if self.fail_optional:
+            raise render_ops.OpsError("optional Blueprint query denied")
+        return self.blueprint_rows, self.blueprints_complete
+
+    def blueprint(self, blueprint_id: str) -> dict:
+        if self.fail_optional:
+            raise render_ops.OpsError("optional Blueprint detail denied")
+        return self.blueprint_details[blueprint_id]
+
+    def audit_logs(self, owner_id: str, *, start_time: str) -> tuple[list[dict], bool]:
+        assert owner_id == "own-secret"
+        assert start_time == "2026-01-02T03:04:05Z"
+        if self.fail_optional:
+            raise render_ops.OpsError("optional audit query denied")
+        return self.audit_rows, self.audits_complete
+
+
+def test_creation_evidence_sanitizers_reject_control_text_and_invalid_times() -> None:
+    assert render_ops._safe_history_label("library") == "library"
+    assert render_ops._safe_history_label("secret\nvalue") is None
+    assert render_ops._safe_history_label("x" * 129) is None
+    assert render_ops._safe_history_timestamp("2026-01-02T03:04:05Z") == (
+        "2026-01-02T03:04:05Z"
+    )
+    assert render_ops._safe_history_timestamp("secret") is None
+    assert render_ops._safe_history_timestamp("2026-01-02T03:04:05") is None
+
+
+def test_creation_evidence_reports_only_sanitized_linkage_and_rename_history(
+    monkeypatch: pytest.MonkeyPatch, config: render_ops.ProductionConfig
+) -> None:
+    client = CreationEvidenceClient(
+        config,
+        blueprints=[{"id": "bpr-library", "name": "Library production"}],
+        blueprint_details={
+            "bpr-library": {
+                "id": "bpr-library",
+                "name": "Library production",
+                "resources": [
+                    {"id": config.service_id, "name": "library", "type": "web_service"},
+                    {"id": "srv-unrelated", "name": "secret-resource", "type": "web_service"},
+                ],
+            }
+        },
+        audits=[
+            {
+                "timestamp": "2026-02-01T00:00:00Z",
+                "event": "UpdateServiceNameEvent",
+                "metadata": {
+                    "serviceId": config.service_id,
+                    "oldName": "library-old",
+                    "newName": "library",
+                    "token": "must-not-escape",
+                },
+                "actor": {"email": "must-not-escape@example.invalid"},
+            },
+            {
+                "timestamp": "2026-01-02T03:04:05Z",
+                "event": "ApplyBlueprintEvent",
+                "metadata": {"resourceId": config.service_id},
+            },
+            {
+                "timestamp": "2026-02-02T00:00:00Z",
+                "event": "UpdateServiceNameEvent",
+                "metadata": {"serviceId": "srv-unrelated", "newName": "ignore-me"},
+            },
+        ],
+    )
+    monkeypatch.setattr(render_ops, "_client", lambda args: (client, config))
+    result = render_ops.command_creation_evidence(SimpleNamespace())
+    assert result == {
+        "service_id": config.service_id,
+        "created_at": {"state": "observed", "value": "2026-01-02T03:04:05Z"},
+        "creation_mode": {
+            "state": "blueprint",
+            "basis": "current-blueprint-resource-linkage",
+        },
+        "blueprint_linkage": {
+            "state": "currently-linked",
+            "blueprints": [{"id": "bpr-library", "name": "Library production"}],
+        },
+        "rename_history": {
+            "state": "observed",
+            "events": [
+                {
+                    "timestamp": "2026-02-01T00:00:00Z",
+                    "from": "library-old",
+                    "to": "library",
+                }
+            ],
+            "coverage": "returned-audit-window-only",
+        },
+        "region_history": {
+            "state": "unknown",
+            "reason": "render-audit-contract-has-no-service-region-history-event",
+        },
+    }
+    encoded = json.dumps(result)
+    for forbidden in (
+        "own-secret",
+        "secret-resource",
+        "must-not-escape",
+        "must-not-escape@example.invalid",
+        "srv-unrelated",
+    ):
+        assert forbidden not in encoded
+
+
+def test_creation_evidence_keeps_observed_rename_from_incomplete_window(
+    monkeypatch: pytest.MonkeyPatch, config: render_ops.ProductionConfig
+) -> None:
+    client = CreationEvidenceClient(
+        config,
+        audits=[
+            {
+                "timestamp": "2026-02-01T00:00:00Z",
+                "event": "UpdateServiceNameEvent",
+                "metadata": {
+                    "service": config.service_id,
+                    "from": "old",
+                    "to": "library",
+                },
+            }
+        ],
+        audits_complete=False,
+    )
+    monkeypatch.setattr(render_ops, "_client", lambda args: (client, config))
+    result = render_ops.command_creation_evidence(SimpleNamespace())
+    assert result["rename_history"] == {
+        "state": "observed",
+        "events": [
+            {"timestamp": "2026-02-01T00:00:00Z", "from": "old", "to": "library"}
+        ],
+        "coverage": "incomplete-returned-audit-window",
+    }
+
+
+def test_creation_evidence_does_not_turn_empty_history_into_proof(
+    monkeypatch: pytest.MonkeyPatch, config: render_ops.ProductionConfig
+) -> None:
+    client = CreationEvidenceClient(config)
+    monkeypatch.setattr(render_ops, "_client", lambda args: (client, config))
+    result = render_ops.command_creation_evidence(SimpleNamespace())
+    assert result["blueprint_linkage"] == {"state": "not-currently-linked"}
+    assert result["creation_mode"]["state"] == "unknown"
+    assert result["rename_history"] == {
+        "state": "none-observed",
+        "coverage": "returned-audit-window-only-not-proof-of-no-history",
+    }
+    assert result["region_history"]["state"] == "unknown"
+
+
+def test_creation_evidence_reports_absent_service_fields_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, config: render_ops.ProductionConfig
+) -> None:
+    class MissingFieldsClient(CreationEvidenceClient):
+        def service(self, service_id: str) -> dict:
+            return service(config)
+
+    client = MissingFieldsClient(config)
+    monkeypatch.setattr(render_ops, "_client", lambda args: (client, config))
+    result = render_ops.command_creation_evidence(SimpleNamespace())
+    assert result["created_at"] == {
+        "state": "unknown",
+        "reason": "service-created-at-absent",
+    }
+    assert result["blueprint_linkage"] == {
+        "state": "unknown",
+        "reason": "service-owner-id-absent",
+    }
+    assert result["rename_history"]["state"] == "unknown"
+    assert result["creation_mode"]["state"] == "unknown"
+
+
+def test_creation_evidence_reports_optional_api_failure_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, config: render_ops.ProductionConfig
+) -> None:
+    client = CreationEvidenceClient(config, fail_optional=True)
+    monkeypatch.setattr(render_ops, "_client", lambda args: (client, config))
+    result = render_ops.command_creation_evidence(SimpleNamespace())
+    assert result["blueprint_linkage"] == {
+        "state": "unknown",
+        "reason": "blueprint-inventory-incomplete",
+    }
+    assert result["rename_history"] == {
+        "state": "unknown",
+        "reason": "audit-history-incomplete-or-unavailable",
+    }
+    assert result["creation_mode"]["state"] == "unknown"
+
+
 class RecordingEvidence:
     def __init__(self) -> None:
         self.events: list[dict] = []
@@ -2438,6 +2691,20 @@ def test_command_wait_is_restartable(
     )
     args = SimpleNamespace(deploy_id="dep-candidate", commit="b" * 40, timeout=30)
     assert render_ops.command_wait(args)["deploy"]["id"] == "dep-candidate"
+
+
+def test_creation_evidence_make_target_is_one_read_only_checked_in_command() -> None:
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        ["make", "-n", "prod-creation-evidence"],
+        cwd=root,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.stdout.splitlines() == [
+        "uv run python scripts/render_ops.py creation-evidence"
+    ]
 
 
 def test_make_mutation_recipe_does_not_shell_interpolate_values() -> None:

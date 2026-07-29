@@ -24,7 +24,7 @@ from http.client import HTTPException, IncompleteRead
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -822,6 +822,66 @@ class RenderClient:
     def deploy_by_id(self, service_id: str, deploy_id: str) -> dict[str, Any]:
         return _unwrap(self.request("GET", f"/services/{service_id}/deploys/{deploy_id}"), "deploy")
 
+    def _cursor_pages(
+        self,
+        path: str,
+        *,
+        item_key: str,
+        query: dict[str, str] | None = None,
+        max_pages: int = 100,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        items: list[dict[str, Any]] = []
+        cursor = ""
+        seen: set[str] = set()
+        for _ in range(max_pages):
+            parameters = {**(query or {}), "limit": "100"}
+            if cursor:
+                parameters["cursor"] = cursor
+            response = self.request("GET", f"{path}?{urlencode(parameters)}")
+            if not isinstance(response, list):
+                raise OpsError(f"Render API {path} returned a non-list page")
+            raw_cursor = (
+                response[-1].get("cursor")
+                if len(response) == 100 and isinstance(response[-1], dict)
+                else None
+            )
+            if len(response) == 100 and (
+                not isinstance(raw_cursor, str)
+                or not raw_cursor
+                or raw_cursor in seen
+            ):
+                return items, False
+            for raw in response:
+                item = _unwrap(raw, item_key)
+                if not isinstance(item, dict):
+                    raise OpsError(f"Render API {path} returned an invalid {item_key}")
+                items.append(item)
+            if len(response) < 100:
+                return items, True
+            seen.add(raw_cursor)
+            cursor = raw_cursor
+        return items, False
+
+    def blueprints(self, owner_id: str) -> tuple[list[dict[str, Any]], bool]:
+        return self._cursor_pages(
+            "/blueprints", item_key="blueprint", query={"ownerId": owner_id}
+        )
+
+    def blueprint(self, blueprint_id: str) -> dict[str, Any]:
+        value = self.request("GET", f"/blueprints/{blueprint_id}")
+        if not isinstance(value, dict):
+            raise OpsError("Render API returned an invalid Blueprint")
+        return value
+
+    def audit_logs(
+        self, owner_id: str, *, start_time: str
+    ) -> tuple[list[dict[str, Any]], bool]:
+        return self._cursor_pages(
+            f"/owners/{owner_id}/audit-logs",
+            item_key="auditLog",
+            query={"startTime": start_time},
+        )
+
 
 def _unwrap(value: Any, key: str) -> Any:
     if isinstance(value, dict) and key in value:
@@ -1487,6 +1547,184 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+_AUDIT_SERVICE_KEYS = frozenset(
+    {"service", "serviceId", "server", "serverId", "resource", "resourceId"}
+)
+
+
+def _safe_history_label(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
+
+
+def _safe_history_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return value
+
+
+def _audit_targets_service(metadata: Any, service_id: str) -> bool:
+    return isinstance(metadata, dict) and any(
+        metadata.get(key) == service_id for key in _AUDIT_SERVICE_KEYS
+    )
+
+
+def _rename_summary(log: dict[str, Any]) -> dict[str, Any]:
+    metadata = log.get("metadata") if isinstance(log.get("metadata"), dict) else {}
+    before = next(
+        (
+            _safe_history_label(metadata.get(key))
+            for key in ("from", "oldName", "previousName")
+            if _safe_history_label(metadata.get(key)) is not None
+        ),
+        None,
+    )
+    after = next(
+        (
+            _safe_history_label(metadata.get(key))
+            for key in ("to", "newName", "name")
+            if _safe_history_label(metadata.get(key)) is not None
+        ),
+        None,
+    )
+    return {
+        "timestamp": _safe_history_timestamp(log.get("timestamp")),
+        "from": before,
+        "to": after,
+    }
+
+
+def command_creation_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    client, config = _client(args)
+    service = client.service(config.service_id)
+    validate_service(service, config)
+    created_at = _safe_history_timestamp(service.get("createdAt"))
+    created = (
+        {"state": "observed", "value": created_at}
+        if created_at is not None
+        else {"state": "unknown", "reason": "service-created-at-absent"}
+    )
+    owner_id = service.get("ownerId")
+
+    linkage: dict[str, Any]
+    linked_blueprints: list[dict[str, str]] = []
+    blueprints_complete = False
+    if not isinstance(owner_id, str) or not owner_id:
+        linkage = {"state": "unknown", "reason": "service-owner-id-absent"}
+    else:
+        try:
+            blueprints, blueprints_complete = client.blueprints(owner_id)
+            for summary in blueprints:
+                blueprint_id = summary.get("id")
+                if not isinstance(blueprint_id, str) or not re.fullmatch(
+                    r"bpr-[a-z0-9]+", blueprint_id
+                ):
+                    blueprints_complete = False
+                    continue
+                detail = client.blueprint(blueprint_id)
+                resources = detail.get("resources")
+                if not isinstance(resources, list):
+                    blueprints_complete = False
+                    continue
+                if any(
+                    isinstance(resource, dict)
+                    and resource.get("id") == config.service_id
+                    for resource in resources
+                ):
+                    name = _safe_history_label(detail.get("name"))
+                    linked_blueprints.append(
+                        {"id": blueprint_id, "name": name or "unknown"}
+                    )
+        except OpsError:
+            blueprints_complete = False
+        if linked_blueprints and blueprints_complete:
+            linkage = {
+                "state": "currently-linked",
+                "blueprints": sorted(linked_blueprints, key=lambda item: item["id"]),
+            }
+        elif blueprints_complete:
+            linkage = {"state": "not-currently-linked"}
+        else:
+            linkage = {"state": "unknown", "reason": "blueprint-inventory-incomplete"}
+
+    matching_audits: list[dict[str, Any]] = []
+    audits_complete = False
+    if isinstance(owner_id, str) and owner_id and isinstance(created_at, str) and created_at:
+        try:
+            audits, audits_complete = client.audit_logs(owner_id, start_time=created_at)
+            matching_audits = [
+                log
+                for log in audits
+                if _audit_targets_service(log.get("metadata"), config.service_id)
+            ]
+        except OpsError:
+            audits_complete = False
+    rename_events = [
+        _rename_summary(log)
+        for log in matching_audits
+        if log.get("event") == "UpdateServiceNameEvent"
+    ]
+    if rename_events:
+        rename_history: dict[str, Any] = {
+            "state": "observed",
+            "events": sorted(rename_events, key=lambda item: str(item["timestamp"])),
+            "coverage": (
+                "returned-audit-window-only"
+                if audits_complete
+                else "incomplete-returned-audit-window"
+            ),
+        }
+    elif not audits_complete:
+        rename_history = {
+            "state": "unknown",
+            "reason": "audit-history-incomplete-or-unavailable",
+        }
+    else:
+        rename_history = {
+            "state": "none-observed",
+            "coverage": "returned-audit-window-only-not-proof-of-no-history",
+        }
+
+    blueprint_audit_observed = any(
+        log.get("event") == "ApplyBlueprintEvent" for log in matching_audits
+    )
+    if linkage.get("state") == "currently-linked" or blueprint_audit_observed:
+        creation_mode = {
+            "state": "blueprint",
+            "basis": (
+                "current-blueprint-resource-linkage"
+                if linkage.get("state") == "currently-linked"
+                else "service-targeted-apply-blueprint-audit"
+            ),
+        }
+    else:
+        creation_mode = {
+            "state": "unknown",
+            "reason": "no-immutable-manual-versus-blueprint-creation-field",
+        }
+
+    return {
+        "service_id": config.service_id,
+        "created_at": created,
+        "creation_mode": creation_mode,
+        "blueprint_linkage": linkage,
+        "rename_history": rename_history,
+        "region_history": {
+            "state": "unknown",
+            "reason": "render-audit-contract-has-no-service-region-history-event",
+        },
+    }
+
+
 def command_deploy(args: argparse.Namespace) -> dict[str, Any]:
     client, config = _client(args)
     _confirm_apply(args, config)
@@ -1666,6 +1904,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--env-file", default=os.environ.get("RENDER_ENV_FILE", "~/.aweb-render/env"))
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("creation-evidence")
     proof = sub.add_parser("health-client-proof")
     proof.add_argument("--expected-commit", default=os.environ.get("CURRENT_COMMIT", ""))
     proof.add_argument(
@@ -1713,6 +1952,8 @@ def main() -> int:
             raise OpsError("PROD_EVIDENCE_DIR/--evidence-dir is required for health evidence")
         if args.command == "status":
             result = command_status(args)
+        elif args.command == "creation-evidence":
+            result = command_creation_evidence(args)
         elif args.command == "health-client-proof":
             if not args.evidence_dir:
                 raise OpsError("PROD_EVIDENCE_DIR/--evidence-dir is required")
