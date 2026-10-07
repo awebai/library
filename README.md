@@ -101,3 +101,13 @@ must use those checked-in Make targets rather than ad-hoc commands.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Private AWID teams
+
+Set `LIBRARY_AWID_SERVICE_TOKEN` through the deployment secret store when the
+registry requires trusted-service access to private teams. The optional token is
+sent as `X-AWID-Service-Token` on both team-facts and certificate/revocation reads;
+blank or unset values send no header. It does not replace request signatures or
+team-certificate verification. AWID's `403 team_private` becomes HTTP 403 with
+`detail.code=team_private_unreadable`; registry outages and timeouts remain 503.
+Never put the token in source, logs, or client manifests.
