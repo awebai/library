@@ -92,7 +92,8 @@ async def test_team_request_authenticates(monkeypatch, private, configured, faul
             json={
                 "certificates": [{"certificate_id": "synthetic-cert", "revoked_at": now}]
                 if fault == "revoked"
-                else []
+                else [],
+                "has_more": False,
             }
             if req.url.path.endswith("/certificates")
             else {"team_did_key": team_did},
